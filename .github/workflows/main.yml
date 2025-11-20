@@ -1,0 +1,179 @@
+name: Golang PR Service Check
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+on:
+  pull_request:
+    branches:
+      - main
+      - feature-*
+      - feature/**/*
+      - feature_*
+
+jobs:
+  detect-changes:
+    name: Detect Golang Changes
+    runs-on: ubuntu-latest
+    outputs:
+      filtered_dirs: ${{ steps.filtered-dirs.outputs.filtered_dirs }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: services/**
+          dir_names: true
+          dir_names_max_depth: 2
+
+      - name: Filter directories
+        id: filtered-dirs
+        uses: ./.github/actions/folders-filter
+        with:
+          folders: ${{ steps.changed-files.outputs.all_changed_files }}
+          file: go.mod
+
+  service-checks:
+    name: Golang Service Checks
+    needs: detect-changes
+    if: ${{ fromJson(needs.detect-changes.outputs.filtered_dirs)[0] != null }}
+    runs-on: ubuntu-latest
+    permissions: write-all
+    strategy:
+      matrix:
+        dir: ${{fromJson(needs.detect-changes.outputs.filtered_dirs)}}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.5'
+
+      - name: Validate dependency versions
+        if: github.base_ref == 'main'
+        working-directory: ${{ matrix.dir }}
+        run: |
+          echo "Checking go.mod for common-go and common-git dependency versions..."
+          
+          # Check if go.mod exists
+          if [ ! -f "go.mod" ]; then
+            echo "No go.mod found in ${{ matrix.dir }}, skipping dependency check"
+            exit 0
+          fi
+          
+          # Function to check if a version is a commit hash (pseudo-version)
+          check_dependency_version() {
+            local dep_name="$1"
+            local version_line=$(grep "$dep_name" go.mod | grep -v "replace" | grep -v "//replace" | head -1)
+            
+            if [ -z "$version_line" ]; then
+              echo "✓ $dep_name not found in go.mod"
+              return 0
+            fi
+            
+            echo "Found dependency: $version_line"
+            
+            # Extract version part (everything after the last space)
+            local version=$(echo "$version_line" | awk '{print $NF}')
+            
+            # Check if it's a pseudo-version (contains timestamp and commit hash)
+            # Pseudo-versions have format: v0.0.0-YYYYMMDDHHMMSS-abcdefabcdef
+            if echo "$version" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{14}-[a-f0-9]{12}$' > /dev/null; then
+              echo "❌ ERROR: $dep_name is using a commit hash version: $version"
+              echo "Please use a proper tagged version (e.g., v1.2.3) instead of a commit hash"
+              return 1
+            elif echo "$version" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' > /dev/null; then
+              echo "✓ $dep_name is using a proper tagged version: $version"
+              return 0
+            else
+              echo "⚠️  WARNING: $dep_name has an unusual version format: $version"
+              echo "Please verify this is a proper tagged version"
+              return 1
+            fi
+          }
+          
+          # Check both dependencies
+          exit_code=0
+          
+          check_dependency_version "backline/common-go" || exit_code=1
+          check_dependency_version "backline/common-git" || exit_code=1
+          check_dependency_version "backline/workflow-sdk-go" || exit_code=1
+          
+          if [ $exit_code -eq 1 ]; then
+            echo ""
+            echo "❌ Dependency version validation failed!"
+            echo "Please ensure common modules (common-go, common-git, workflow-sdk-go) use tagged versions (e.g., v1.2.3) instead of commit hashes"
+            exit 1
+          else
+            echo ""
+            echo "✅ All dependency versions are valid"
+          fi
+
+      - name: "Set coverage config"
+        id: set_coverage_config
+        uses: ./.github/actions/get-go-test-coverage-config
+        with:
+          package-folder: ${{ matrix.dir }}
+
+      - name: Build docker and generate test coverage
+        id: coverage
+        working-directory: ${{ matrix.dir }}
+        env:
+          COVERAGE_CONFIG: ${{ steps.set_coverage_config.outputs.coverage-config }}
+          DOCKER_BUILDKIT: 1
+        run: |
+          # Generate a .netrc file
+          touch ${HOME}/.netrc
+          echo machine github.com >> ${HOME}/.netrc
+          echo login ${{ secrets.GITHUB_TOKEN }} >> ${HOME}/.netrc
+          echo password ${{ secrets.GITHUB_TOKEN }} >> ${HOME}/.netrc
+          # Generate a test coverage file (cover.out)
+          docker build -t svc . --target builder --secret id=netrc,src=${HOME}/.netrc --build-arg AUTH_METHOD=token
+
+          # Use courtney to generate the coverage file becuase it ignores "return err" statements
+          docker run -v $(pwd):/src -v /var/run/docker.sock:/var/run/docker.sock svc /bin/sh -c "go install github.com/dave/courtney@v0.4.4 && courtney_path=\$(find \$(go env GOPATH) -name courtney -type f | head -n1) && "\$courtney_path" -o /src/cover.out -t='-covermode=atomic'"
+
+          echo "Installing go-test-coverage"
+          export GOPATH="$HOME/go"
+          PATH="$GOPATH/bin:$PATH"
+          go install github.com/vladopajic/go-test-coverage/v2@latest
+
+          echo "Checking test coverage"
+          go-test-coverage -c "$COVERAGE_CONFIG" > report.txt || coverage_exit_code=$(grep -c 'FAIL' report.txt) || true
+
+          json_report=$(jq -Rs '.' report.txt)
+          echo $json_report
+
+          echo "report=$json_report" >> $GITHUB_OUTPUT
+          echo "report_status=$coverage_exit_code" >> $GITHUB_OUTPUT
+
+      - name: find if coverage report is already present
+        if: steps.coverage.outputs.report
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '${{ matrix.dir }} coverage report:'
+
+      - name: post coverage report
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            ${{ matrix.dir }} coverage report:
+            ```
+            ${{ fromJSON(steps.coverage.outputs.report) }} ```
+
+      - name: "finally check coverage"
+        if: steps.coverage.outputs.report_status != 0
+        shell: bash
+        run: echo "coverage check failed" && exit 1
