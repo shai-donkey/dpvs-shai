@@ -5,7 +5,7 @@ go 1.22
 toolchain go1.24.0
 
 require (
-	github.com/quic-go/quic-go v0.49.0
+	github.com/quic-go/quic-go v0.49.1
 	golang.org/x/sys v0.23.0
 )
 
