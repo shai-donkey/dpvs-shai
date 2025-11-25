@@ -6,7 +6,7 @@
 
 `DPVS` is a high performance **Layer-4 load balancer** based on [DPDK](http://dpdk.org). It's derived from Linux Virtual Server [LVS](http://www.linuxvirtualserver.org/) and its modification [alibaba/LVS](https://github.com/alibaba/LVS).
 
-> Notes: The name `DPVS` comes from "DPDK-LVS".
+> Notes: The name `DPVS` comes from "DPDK-LVS".  THIS IS A NEW SENTENCE
 
 ![dpvs.png](./pic/dpvs.png)
 
